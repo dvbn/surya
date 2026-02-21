@@ -41,8 +41,7 @@ class TableRecPredictor(BasePredictor):
         shaper = LabelShaper()
         batch_predictions = [[] for _ in range(current_batch_size)]
         max_tokens = settings.TABLE_REC_MAX_BOXES
-        decoder_position_ids = torch.ones_like(batch_input_ids[0, :, 0], dtype=torch.int64, device=self.model.device).cumsum(
-            0) - 1
+        decoder_position_ids = torch.arange(batch_input_ids.shape[1], dtype=torch.int64, device=self.model.device)
         inference_token_count = batch_input_ids.shape[1]
 
         if settings.TABLE_REC_STATIC_CACHE:
