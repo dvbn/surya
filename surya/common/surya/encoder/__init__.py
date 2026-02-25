@@ -434,8 +434,15 @@ class Qwen2_5_VLVisionSdpaAttention(nn.Module):
         num_heads = q.shape[1]
         head_dim = q.shape[2]
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]  # Keep as tensor
-        max_seq_len = seq_lengths.max().item()  # Use .max() on tensor
+        # Compute seq_lengths and max on CPU when on MPS — MPS integer
+        # arithmetic can produce corrupted values that trigger out-of-bounds errors.
+        if device.type == "mps":
+            cu_cpu = cu_seqlens.cpu()
+            seq_lengths = (cu_cpu[1:] - cu_cpu[:-1]).to(device)
+            max_seq_len = int(seq_lengths.cpu().max().item())
+        else:
+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seq_len = seq_lengths.max().item()
 
         if settings.FOUNDATION_STATIC_CACHE:
             # Pad max_seq_len to the nearest multiple for compilation
@@ -743,14 +750,25 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
         )
         position_embeddings = (emb.cos(), emb.sin())
 
-        cu_seqlens = (grid_thw[:, :, 1] * grid_thw[:, :, 2]).cumsum(
-            dim=1,
-            # Select dtype based on the following factors:
-            #  - FA2 requires that cu_seqlens_q must have dtype int32
-            #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
-            # See https://github.com/huggingface/transformers/pull/34852 for more information
-            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
-        )
+        # Compute cumsum on CPU when running on MPS — MPS int32/int64 cumsum
+        # kernels are unreliable and produce corrupted indices that cascade into
+        # out-of-bounds errors in downstream attention code.
+        seq_lens = grid_thw[:, :, 1] * grid_thw[:, :, 2]
+        target_device = seq_lens.device
+        if target_device.type == "mps":
+            cu_seqlens = seq_lens.cpu().cumsum(
+                dim=1,
+                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            ).to(target_device)
+        else:
+            cu_seqlens = seq_lens.cumsum(
+                dim=1,
+                # Select dtype based on the following factors:
+                #  - FA2 requires that cu_seqlens_q must have dtype int32
+                #  - torch.onnx.export requires that cu_seqlens_q must have same dtype as grid_thw
+                # See https://github.com/huggingface/transformers/pull/34852 for more information
+                dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+            )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         for layer_num, blk in enumerate(self.blocks):
             if self.gradient_checkpointing and self.training:
